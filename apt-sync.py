@@ -30,6 +30,9 @@ logger.addHandler(handler)
 APT_SYNC_USER_AGENT = os.getenv("APT_SYNC_USER_AGENT", "APT-Mirror-Tool/1.0")
 requests.utils.default_user_agent = lambda: APT_SYNC_USER_AGENT
 
+session = requests.Session()
+session.headers.update({"User-Agent": APT_SYNC_USER_AGENT})
+
 # set preferred address family
 import requests.packages.urllib3.util.connection as urllib3_cn
 
@@ -45,9 +48,17 @@ if USE_ADDR_FAMILY != "":
 
 OS_TEMPLATE = {
     "ubuntu-lts": ["jammy", "noble"],
+    "ubuntu-lts-all": ["xenial", "bionic", "focal", "jammy", "noble"],
+    "ubuntu-all": ["focal", "jammy", "lunar", "mantic", "noble", "oracular", "plucky", "questing"],
     "debian-current": ["bullseye", "bookworm", "trixie"],
+    "debian-all": ["jessie", "stretch", "buster", "bullseye", "bookworm", "trixie"],
     "debian-latest2": ["bookworm", "trixie"],
     "debian-latest": ["trixie"],
+}
+ARCH_TEMPLATE = {
+    "all": ["amd64", "i386", "arm64", "armhf", "armel", "ppc64el", "s390x", "riscv64"],
+    "common": ["amd64", "i386", "arm64", "armhf"],
+    "x86": ["amd64", "i386"],
 }
 ARCH_NO_PKGIDX = ["dep11", "i18n", "cnf", "neon"]
 MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
@@ -81,6 +92,16 @@ def replace_os_template(os_list: List[str]) -> List[str]:
     return ret
 
 
+def replace_arch_template(arch_list: List[str]) -> List[str]:
+    ret = []
+    for i in arch_list:
+        if i.startswith("@"):
+            ret.extend(ARCH_TEMPLATE[i[1:]])
+        else:
+            ret.append(i)
+    return ret
+
+
 def check_and_download(url: str, dst_file: Path, caching=False) -> int:
     try:
         if caching:
@@ -91,7 +112,7 @@ def check_and_download(url: str, dst_file: Path, caching=False) -> int:
                 return 0
             download_cache[url] = bytes()
         start = time.time()
-        with requests.get(url, stream=True, timeout=(5, 10)) as r:
+        with session.get(url, stream=True, timeout=(5, 10)) as r:
             r.raise_for_status()
             if "last-modified" in r.headers:
                 remote_ts = parsedate_to_datetime(
@@ -371,9 +392,11 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("base_url", type=str, help="base URL")
-    parser.add_argument("os_version", type=str, help="e.g. buster,@ubuntu-lts")
+    parser.add_argument("os_version", type=str, nargs="?", default="@debian-current",
+                        help="e.g. buster,@ubuntu-lts (default: @debian-current)")
     parser.add_argument("component", type=str, help="e.g. multiverse,contrib")
-    parser.add_argument("arch", type=str, help="e.g. i386,amd64")
+    parser.add_argument("arch", type=str, nargs="?", default="@common",
+                        help="e.g. i386,amd64,@all (default: @common -> amd64,i386,arm64,armhf)")
     parser.add_argument("working_dir", type=Path, help="working directory")
     parser.add_argument(
         "--delete", action="store_true", help="delete unreferenced package files"
@@ -383,7 +406,27 @@ def main():
         action="store_true",
         help="print package files to be deleted only",
     )
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default=os.getenv("APT_SYNC_PROXY", ""),
+        help="proxy URL for HTTP/HTTPS requests (e.g. http://proxy:8080 or socks5h://proxy:1080); "
+             "overrides APT_SYNC_PROXY env var",
+    )
     args = parser.parse_args()
+
+    if args.proxy:
+        proxy_url = args.proxy
+        if proxy_url.startswith("socks"):
+            try:
+                import socks  # noqa: F401
+            except ImportError:
+                logger.warning(
+                    "SOCKS proxy requested but PySocks is not installed. "
+                    "Install it with: pip install requests[socks]"
+                )
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        logger.info(f"Using proxy: {proxy_url}")
 
     # generate lists of os codenames
     os_list = args.os_version.split(",")
@@ -409,7 +452,7 @@ def main():
         return lists
 
     component_lists = generate_list_for_oses(args.component, "component")
-    arch_lists = generate_list_for_oses(args.arch, "arch")
+    arch_lists = [replace_arch_template(al) for al in generate_list_for_oses(args.arch, "arch")]
 
     logger.info(f"Configuration: {os_list=}, {component_lists=}, {arch_lists=}")
 
@@ -417,16 +460,16 @@ def main():
     failed = []
     deb_set = {}
 
-    for os, arch_list, comp_list in zip(os_list, arch_lists, component_lists):
+    for dist, arch_list, comp_list in zip(os_list, arch_lists, component_lists):
         for comp in comp_list:
             for arch in arch_list:
                 if (
                     apt_mirror(
-                        args.base_url, os, comp, arch, args.working_dir, deb_set=deb_set
+                        args.base_url, dist, comp, arch, args.working_dir, deb_set=deb_set
                     )
                     != 0
                 ):
-                    failed.append((os, comp, arch))
+                    failed.append((dist, comp, arch))
     if len(failed) > 0:
         logger.error(f"Failed APT repos of {args.base_url}: {failed}")
         return
