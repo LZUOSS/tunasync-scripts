@@ -108,15 +108,33 @@ def format_size(size: int) -> str:
     return f"{size}B"
 
 
-def print_progress(url: str, written: int, total: int, done: bool = False):
+def print_progress(
+    url: str,
+    written: int,
+    total: int,
+    start_ts: float,
+    status: str,
+    attempt: int,
+    max_attempt: int,
+    done: bool = False,
+):
     if not is_interactive_shell():
         return
     filename = url.rsplit("/", 1)[-1]
+    elapsed = max(time.time() - start_ts, 0.001)
+    speed = written / elapsed
     if total > 0:
         pct = min(100.0, (written / total) * 100)
-        msg = f"{filename}: {pct:6.2f}% ({format_size(written)}/{format_size(total)})"
+        msg = (
+            f"downloading {filename} [{attempt}/{max_attempt}] "
+            f"{pct:6.2f}% ({format_size(written)}/{format_size(total)}) "
+            f"{format_size(int(speed))}/s {status}"
+        )
     else:
-        msg = f"{filename}: {format_size(written)}"
+        msg = (
+            f"downloading {filename} [{attempt}/{max_attempt}] "
+            f"{format_size(written)} {format_size(int(speed))}/s {status}"
+        )
     with progress_lock:
         if done:
             sys.stderr.write(f"\r{msg}\n")
@@ -155,8 +173,15 @@ def replace_arch_template(arch_list: List[str]) -> List[str]:
     return ret
 
 
-def check_and_download(url: str, dst_file: Path, caching=False, retries: int = MAX_RETRY) -> int:
-    for attempt in range(1, retries + 1):
+def check_and_download(
+    url: str,
+    dst_file: Path,
+    caching=False,
+    retries: int = MAX_RETRY,
+    display_attempt: int = 1,
+    max_attempt: int = 1,
+) -> int:
+    for net_attempt in range(1, retries + 1):
         try:
             if caching:
                 if url in download_cache:
@@ -190,22 +215,59 @@ def check_and_download(url: str, dst_file: Path, caching=False, retries: int = M
                         if caching:
                             download_cache[url] += chunk
                         if time.time() - last_progress >= 0.2:
-                            print_progress(url, written, remote_size)
+                            print_progress(
+                                url,
+                                written,
+                                remote_size,
+                                start,
+                                status="downloading",
+                                attempt=display_attempt,
+                                max_attempt=max_attempt,
+                            )
                             last_progress = time.time()
-                print_progress(url, written, remote_size, done=True)
+                print_progress(
+                    url,
+                    written,
+                    remote_size,
+                    start,
+                    status="done",
+                    attempt=display_attempt,
+                    max_attempt=max_attempt,
+                    done=True,
+                )
                 if remote_ts is not None:
                     os.utime(dst_file, (remote_ts, remote_ts))
             return 0
         except BaseException as e:
-            logger.error(f"Error occurred (attempt {attempt}/{retries}): {e}")
+            logger.error(f"Error occurred (attempt {net_attempt}/{retries}): {e}")
             if dst_file.is_file():
                 dst_file.unlink()
             if url in download_cache:
                 del download_cache[url]
-            if attempt < retries:
-                sleep_seconds = RETRY_WAIT_SECONDS * attempt
+            if net_attempt < retries:
+                sleep_seconds = RETRY_WAIT_SECONDS * net_attempt
                 logger.info(f"Retrying {url} in {sleep_seconds:.1f}s")
+                print_progress(
+                    url,
+                    0,
+                    0,
+                    start_ts=time.time(),
+                    status=f"retry in {sleep_seconds:.1f}s",
+                    attempt=display_attempt,
+                    max_attempt=max_attempt,
+                )
                 time.sleep(sleep_seconds)
+            else:
+                print_progress(
+                    url,
+                    0,
+                    0,
+                    start_ts=time.time(),
+                    status="failed",
+                    attempt=display_attempt,
+                    max_attempt=max_attempt,
+                    done=True,
+                )
     return 1
 
 
@@ -419,11 +481,21 @@ def apt_mirror(
             pkg_url = f"{base_url}/{pkg_filename}"
             dest_tmp_filename = dest_filename.with_name("._syncing_." + dest_filename.name)
             for retry in range(1, MAX_RETRY + 1):
-                logger.info(
-                    f"downloading {pkg_url} to {dest_filename} "
-                    f"(verify attempt {retry}/{MAX_RETRY})"
-                )
-                if check_and_download(pkg_url, dest_tmp_filename, retries=1) != 0:
+                if not is_interactive_shell():
+                    logger.info(
+                        f"downloading {pkg_url} to {dest_filename} "
+                        f"(verify attempt {retry}/{MAX_RETRY})"
+                    )
+                if (
+                    check_and_download(
+                        pkg_url,
+                        dest_tmp_filename,
+                        retries=1,
+                        display_attempt=retry,
+                        max_attempt=MAX_RETRY,
+                    )
+                    != 0
+                ):
                     continue
 
                 sha = hashlib.sha256()
