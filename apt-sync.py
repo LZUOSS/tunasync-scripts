@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -74,6 +75,7 @@ pattern_package_name = re.compile(r"^Filename: (.+)$", re.MULTILINE)
 pattern_package_size = re.compile(r"^Size: (\d+)$", re.MULTILINE)
 pattern_package_sha256 = re.compile(r"^SHA256: (\w{64})$", re.MULTILINE)
 download_cache = dict()
+progress_lock = threading.Lock()
 
 
 def new_session() -> requests.Session:
@@ -88,6 +90,39 @@ def get_session() -> requests.Session:
     if not hasattr(thread_local, "session"):
         thread_local.session = new_session()
     return thread_local.session
+
+
+def is_interactive_shell() -> bool:
+    return sys.stderr.isatty()
+
+
+def format_size(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    val = float(size)
+    for unit in units:
+        if val < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(val)}{unit}"
+            return f"{val:.1f}{unit}"
+        val /= 1024.0
+    return f"{size}B"
+
+
+def print_progress(url: str, written: int, total: int, done: bool = False):
+    if not is_interactive_shell():
+        return
+    filename = url.rsplit("/", 1)[-1]
+    if total > 0:
+        pct = min(100.0, (written / total) * 100)
+        msg = f"{filename}: {pct:6.2f}% ({format_size(written)}/{format_size(total)})"
+    else:
+        msg = f"{filename}: {format_size(written)}"
+    with progress_lock:
+        if done:
+            sys.stderr.write(f"\r{msg}\n")
+        else:
+            sys.stderr.write(f"\r{msg}")
+        sys.stderr.flush()
 
 
 def check_args(prop: str, lst: List[str]):
@@ -133,6 +168,7 @@ def check_and_download(url: str, dst_file: Path, caching=False, retries: int = M
             start = time.time()
             with get_session().get(url, stream=True, timeout=(5, 10)) as r:
                 r.raise_for_status()
+                remote_size = int(r.headers.get("content-length", "0") or "0")
                 if "last-modified" in r.headers:
                     remote_ts = parsedate_to_datetime(
                         r.headers["last-modified"]
@@ -140,6 +176,8 @@ def check_and_download(url: str, dst_file: Path, caching=False, retries: int = M
                 else:
                     remote_ts = None
 
+                written = 0
+                last_progress = 0.0
                 with dst_file.open("wb") as f:
                     for chunk in r.iter_content(chunk_size=1024**2):
                         if time.time() - start > DOWNLOAD_TIMEOUT:
@@ -148,8 +186,13 @@ def check_and_download(url: str, dst_file: Path, caching=False, retries: int = M
                             continue  # filter out keep-alive new chunks
 
                         f.write(chunk)
+                        written += len(chunk)
                         if caching:
                             download_cache[url] += chunk
+                        if time.time() - last_progress >= 0.2:
+                            print_progress(url, written, remote_size)
+                            last_progress = time.time()
+                print_progress(url, written, remote_size, done=True)
                 if remote_ts is not None:
                     os.utime(dst_file, (remote_ts, remote_ts))
             return 0
