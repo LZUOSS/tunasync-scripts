@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import bz2
+import concurrent.futures
 import gzip
 import hashlib
 import logging
@@ -9,6 +10,7 @@ import os
 import re
 import shutil
 import socket
+import threading
 import time
 import traceback
 from email.utils import parsedate_to_datetime
@@ -30,8 +32,8 @@ logger.addHandler(handler)
 APT_SYNC_USER_AGENT = os.getenv("APT_SYNC_USER_AGENT", "APT-Mirror-Tool/1.0")
 requests.utils.default_user_agent = lambda: APT_SYNC_USER_AGENT
 
-session = requests.Session()
-session.headers.update({"User-Agent": APT_SYNC_USER_AGENT})
+SESSION_PROXY = ""
+thread_local = threading.local()
 
 # set preferred address family
 import requests.packages.urllib3.util.connection as urllib3_cn
@@ -63,6 +65,8 @@ ARCH_TEMPLATE = {
 ARCH_NO_PKGIDX = ["dep11", "i18n", "cnf", "neon"]
 MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "1800"))
+RETRY_WAIT_SECONDS = float(os.getenv("RETRY_WAIT_SECONDS", "2"))
+DOWNLOAD_WORKERS = max(1, int(os.getenv("DOWNLOAD_WORKERS", "4")))
 REPO_SIZE_FILE = os.getenv("REPO_SIZE_FILE", "")
 
 pattern_os_template = re.compile(r"@\{(.+)\}")
@@ -70,6 +74,20 @@ pattern_package_name = re.compile(r"^Filename: (.+)$", re.MULTILINE)
 pattern_package_size = re.compile(r"^Size: (\d+)$", re.MULTILINE)
 pattern_package_sha256 = re.compile(r"^SHA256: (\w{64})$", re.MULTILINE)
 download_cache = dict()
+
+
+def new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": APT_SYNC_USER_AGENT})
+    if SESSION_PROXY:
+        s.proxies = {"http": SESSION_PROXY, "https": SESSION_PROXY}
+    return s
+
+
+def get_session() -> requests.Session:
+    if not hasattr(thread_local, "session"):
+        thread_local.session = new_session()
+    return thread_local.session
 
 
 def check_args(prop: str, lst: List[str]):
@@ -102,44 +120,49 @@ def replace_arch_template(arch_list: List[str]) -> List[str]:
     return ret
 
 
-def check_and_download(url: str, dst_file: Path, caching=False) -> int:
-    try:
-        if caching:
-            if url in download_cache:
-                logger.info(f"Using cached content: {url}")
+def check_and_download(url: str, dst_file: Path, caching=False, retries: int = MAX_RETRY) -> int:
+    for attempt in range(1, retries + 1):
+        try:
+            if caching:
+                if url in download_cache:
+                    logger.info(f"Using cached content: {url}")
+                    with dst_file.open("wb") as f:
+                        f.write(download_cache[url])
+                    return 0
+                download_cache[url] = bytes()
+            start = time.time()
+            with get_session().get(url, stream=True, timeout=(5, 10)) as r:
+                r.raise_for_status()
+                if "last-modified" in r.headers:
+                    remote_ts = parsedate_to_datetime(
+                        r.headers["last-modified"]
+                    ).timestamp()
+                else:
+                    remote_ts = None
+
                 with dst_file.open("wb") as f:
-                    f.write(download_cache[url])
-                return 0
-            download_cache[url] = bytes()
-        start = time.time()
-        with session.get(url, stream=True, timeout=(5, 10)) as r:
-            r.raise_for_status()
-            if "last-modified" in r.headers:
-                remote_ts = parsedate_to_datetime(
-                    r.headers["last-modified"]
-                ).timestamp()
-            else:
-                remote_ts = None
+                    for chunk in r.iter_content(chunk_size=1024**2):
+                        if time.time() - start > DOWNLOAD_TIMEOUT:
+                            raise TimeoutError("Download timeout")
+                        if not chunk:
+                            continue  # filter out keep-alive new chunks
 
-            with dst_file.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=1024**2):
-                    if time.time() - start > DOWNLOAD_TIMEOUT:
-                        raise TimeoutError("Download timeout")
-                    if not chunk:
-                        continue  # filter out keep-alive new chunks
-
-                    f.write(chunk)
-                    if caching:
-                        download_cache[url] += chunk
-            if remote_ts is not None:
-                os.utime(dst_file, (remote_ts, remote_ts))
-        return 0
-    except BaseException as e:
-        logger.error(f"Error occurred: {e}")
-        if dst_file.is_file():
-            dst_file.unlink()
-        if url in download_cache:
-            del download_cache[url]
+                        f.write(chunk)
+                        if caching:
+                            download_cache[url] += chunk
+                if remote_ts is not None:
+                    os.utime(dst_file, (remote_ts, remote_ts))
+            return 0
+        except BaseException as e:
+            logger.error(f"Error occurred (attempt {attempt}/{retries}): {e}")
+            if dst_file.is_file():
+                dst_file.unlink()
+            if url in download_cache:
+                del download_cache[url]
+            if attempt < retries:
+                sleep_seconds = RETRY_WAIT_SECONDS * attempt
+                logger.info(f"Retrying {url} in {sleep_seconds:.1f}s")
+                time.sleep(sleep_seconds)
     return 1
 
 
@@ -174,6 +197,7 @@ def apt_mirror(
     arch: str,
     dest_base_dir: Path,
     deb_set: Dict[str, int],
+    workers: int,
 ) -> int:
     if not dest_base_dir.is_dir():
         logger.error("Destination directory is empty, cannot continue")
@@ -316,8 +340,7 @@ def apt_mirror(
 
     # Download packages
     err = 0
-    deb_count = 0
-    deb_size = 0
+    packages = []
     for pkg in pkgidx_content.split("\n\n"):
         if len(pkg) < 10:  # ignore blanks
             continue
@@ -330,40 +353,66 @@ def apt_mirror(
             traceback.print_exc()
             err = 1
             continue
-        deb_count += 1
-        deb_size += pkg_size
+        packages.append((pkg_filename, pkg_size, pkg_checksum))
 
+    deb_count = len(packages)
+    deb_size = sum(p[1] for p in packages)
+
+    for pkg_filename, pkg_size, _ in packages:
         dest_filename = dest_base_dir / pkg_filename
-        dest_dir = dest_filename.parent
-        if not dest_dir.is_dir():
-            dest_dir.mkdir(parents=True, exist_ok=True)
         if dest_filename.suffix == ".deb":
             deb_set[str(dest_filename.relative_to(dest_base_dir))] = pkg_size
-        if dest_filename.is_file() and dest_filename.stat().st_size == pkg_size:
-            logger.info(f"Skipping {pkg_filename}, size {pkg_size}")
-            continue
 
-        pkg_url = f"{base_url}/{pkg_filename}"
-        dest_tmp_filename = dest_filename.with_name("._syncing_." + dest_filename.name)
-        for retry in range(MAX_RETRY):
-            logger.info(f"downloading {pkg_url} to {dest_filename}")
-            # break # dry run
-            if check_and_download(pkg_url, dest_tmp_filename) != 0:
-                continue
+    def download_package(pkg_filename: str, pkg_size: int, pkg_checksum: str) -> int:
+        try:
+            dest_filename = dest_base_dir / pkg_filename
+            dest_dir = dest_filename.parent
+            if not dest_dir.is_dir():
+                dest_dir.mkdir(parents=True, exist_ok=True)
+            if dest_filename.is_file() and dest_filename.stat().st_size == pkg_size:
+                logger.info(f"Skipping {pkg_filename}, size {pkg_size}")
+                return 0
 
-            sha = hashlib.sha256()
-            with dest_tmp_filename.open("rb") as f:
-                for block in iter(lambda: f.read(1024**2), b""):
-                    sha.update(block)
-            if sha.hexdigest() != pkg_checksum:
-                logger.error(f"Invalid checksum of {dest_filename}, expected {pkg_checksum}")
-                dest_tmp_filename.unlink()
-                continue
-            dest_tmp_filename.rename(dest_filename)
-            break
-        else:
+            pkg_url = f"{base_url}/{pkg_filename}"
+            dest_tmp_filename = dest_filename.with_name("._syncing_." + dest_filename.name)
+            for retry in range(1, MAX_RETRY + 1):
+                logger.info(
+                    f"downloading {pkg_url} to {dest_filename} "
+                    f"(verify attempt {retry}/{MAX_RETRY})"
+                )
+                if check_and_download(pkg_url, dest_tmp_filename, retries=1) != 0:
+                    continue
+
+                sha = hashlib.sha256()
+                with dest_tmp_filename.open("rb") as f:
+                    for block in iter(lambda: f.read(1024**2), b""):
+                        sha.update(block)
+                if sha.hexdigest() != pkg_checksum:
+                    logger.error(f"Invalid checksum of {dest_filename}, expected {pkg_checksum}")
+                    dest_tmp_filename.unlink()
+                    continue
+                dest_tmp_filename.rename(dest_filename)
+                return 0
             logger.error(f"Failed to download {dest_filename}")
-            err = 1
+            return 1
+        except BaseException:
+            traceback.print_exc()
+            return 1
+
+    if workers <= 1:
+        for pkg_filename, pkg_size, pkg_checksum in packages:
+            if download_package(pkg_filename, pkg_size, pkg_checksum) != 0:
+                err = 1
+    else:
+        logger.info(f"Downloading packages with {workers} workers")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(download_package, pkg_filename, pkg_size, pkg_checksum)
+                for pkg_filename, pkg_size, pkg_checksum in packages
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                if future.result() != 0:
+                    err = 1
 
     if collect_tmp_dir() == 1:
         return 1
@@ -413,8 +462,18 @@ def main():
         help="proxy URL for HTTP/HTTPS requests (e.g. http://proxy:8080 or socks5h://proxy:1080); "
              "overrides APT_SYNC_PROXY env var",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DOWNLOAD_WORKERS,
+        help=f"number of concurrent package download workers (default: {DOWNLOAD_WORKERS})",
+    )
     args = parser.parse_args()
 
+    if args.workers < 1:
+        raise ValueError("workers must be >= 1")
+
+    global SESSION_PROXY
     if args.proxy:
         proxy_url = args.proxy
         if proxy_url.startswith("socks"):
@@ -425,7 +484,7 @@ def main():
                     "SOCKS proxy requested but PySocks is not installed. "
                     "Install it with: pip install requests[socks]"
                 )
-        session.proxies = {"http": proxy_url, "https": proxy_url}
+        SESSION_PROXY = proxy_url
         logger.info(f"Using proxy: {proxy_url}")
 
     # generate lists of os codenames
@@ -465,7 +524,13 @@ def main():
             for arch in arch_list:
                 if (
                     apt_mirror(
-                        args.base_url, dist, comp, arch, args.working_dir, deb_set=deb_set
+                        args.base_url,
+                        dist,
+                        comp,
+                        arch,
+                        args.working_dir,
+                        deb_set=deb_set,
+                        workers=args.workers,
                     )
                     != 0
                 ):
